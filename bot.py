@@ -1,8 +1,9 @@
 import os
 import asyncio
 import logging
+import telebot
+from telebot import types
 from telebot.async_telebot import AsyncTeleBot
-from telebot import telebot, types
 from taskernet import (
     get_inline_data,
     get_message_url_and_button_for,
@@ -10,15 +11,41 @@ from taskernet import (
     TASKERNET_URL,
 )
 from utils import log
-from dotenv import load_dotenv
+from aiohttp import web
 
-load_dotenv()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+APP_ADDRESS = os.environ.get("APP_ADDRESS")
+WEBHOOK_PORT = os.environ.get("PORT")
+WEBHOOK_PATH = f"/{BOT_TOKEN}/"
+WEBHOOK_URL = f"{APP_ADDRESS}:{WEBHOOK_PORT}" + WEBHOOK_PATH
 BOT_USERNAME = telebot.TeleBot(BOT_TOKEN).get_me().username
 
+logger = telebot.logger
+telebot.logger.setLevel(logging.DEBUG)
+
+
 bot = AsyncTeleBot(BOT_TOKEN)
-telebot.logger.setLevel(logging.INFO)
+app = web.Application()
+
+
+async def redirect_to_bot(request):
+    return web.HTTPFound(f"https://t.me/{BOT_USERNAME}")
+
+
+# Process webhook calls
+async def handle(request):
+    if request.match_info.get("token") == bot.token:
+        request_body_dict = await request.json()
+        update = telebot.types.Update.de_json(request_body_dict)
+        tasks = [
+            asyncio.ensure_future(bot.process_new_updates([update])),
+            asyncio.sleep(1)
+        ]
+        await asyncio.gather(*tasks)
+        return web.Response()
+    else:
+        return web.Response(status=403)
 
 
 # send welcome message
@@ -32,7 +59,7 @@ async def send_welcome(message):
         switch_inline_query_chosen_chat=types.SwitchInlineQueryChosenChat(
             query="",
             allow_bot_chats=False,
-            allow_channel_chats=False,
+            allow_channel_chats=True,
             allow_group_chats=True,
             allow_user_chats=True,
         ),
@@ -85,7 +112,7 @@ async def update_message_with_description(chosen):
         id = chosen.inline_message_id
         message, url, buttons = get_message_url_and_button_for(chosen.result_id)
         if not url:
-            log("failed to get url for the share")
+            log("failed to get url for chosen query")
             exit
         description = await get_description(str(url))
         text = str(message) + "\n\n" + description
@@ -94,9 +121,15 @@ async def update_message_with_description(chosen):
         )
 
 
-async def polling():
-    await bot.infinity_polling()
-
-
-if __name__ == "__main__":
-    asyncio.run(polling())
+async def setup():
+    hasWebhook = await bot.get_webhook_info()
+    if hasWebhook: 
+        log("Starting up: removing old webhook")
+        await bot.remove_webhook()
+    log("Starting up: setting webhook")
+    await bot.set_webhook(url=WEBHOOK_URL)
+    app = web.Application()
+    app.router.add_post("/{token}/", handle)
+    app.router.add_get("/", redirect_to_bot)
+    log("webhook set")
+    return app
